@@ -6,7 +6,7 @@ Skrypt diagnostyczny sieci LAN dla Linuksa (np. Raspberry Pi). Wykrywa pętle L2
 
 - Linux, uprawnienia root
 - Python 3.8+
-- [scapy](https://scapy.net/)
+- [scapy](https://scapy.net/) 2.5 lub nowszy
 - `iputils-ping`, `iproute2`
 
 ```bash
@@ -23,6 +23,23 @@ sudo ./netcheck.py -i eth0 --passive-only           # tylko nasłuch, nic nie wy
 
 Bez `-i` skrypt użyje interfejsu z trasą domyślną.
 
+### Podgląd na żywo
+
+W trakcie działania skrypt na bieżąco pokazuje, co się dzieje:
+
+- **faza pasywna:** co sekundę (lub co `--interval`) linia statystyk — ramki/s, broadcast/s, multicast/s, ARP/s, BPDU/s, najgłośniejsze źródło broadcastu. Burza jest od razu oznaczana na żółto/czerwono.
+- **zdarzenia natychmiast**, bez czekania na takt: wykryta pętla (i jej narastanie), nowy root bridge, flaga TC / TCN w STP, kolejny serwer DHCP, cała wymiana DHCP, zmiana MAC dla IP (konflikt, spoofing bramy), nowy router IPv6, sąsiad LLDP, przyrost błędów interfejsu, flap linku.
+- **faza aktywna:** każdy znaleziony host ze skanu ARP, każda oferta DHCP, każda odpowiedź (i brak odpowiedzi) na ping, każda próba MTU, każde zapytanie DNS, każdy hop traceroute. Jeśli przez sekundę nic nie przychodzi, pojawia się linia „… trwa N s” ze stanem bieżącego testu.
+
+```
+22:41:07.3 [  12.0s] ramki    143/s | bcast    11/s | mcast    37/s | ARP    4/s | BPDU   1/s | top bcast: 3c:52:82:aa:bb:cc (6/s)
+22:41:07.6 [WARN] STP: zmiana topologii (flaga TC) od mostu 00:1e:bd:12:34:56
+22:41:08.3 [  13.0s] ramki   2981/s | bcast  2604/s | ...  << BURZA BROADCASTOWA
+22:41:08.3 [CRIT] PĘTLA L2? ta sama ramka 5× w 1.0s: 3c:52:82:aa:bb:cc -> ff:ff:ff:ff:ff:ff: Ether / ARP who has ...
+```
+
+`-q` / `--quiet` wyłącza podgląd (zostaje tylko raport końcowy) — przydatne w cronie.
+
 ### Opcje
 
 | Opcja | Domyślnie | Opis |
@@ -30,6 +47,8 @@ Bez `-i` skrypt użyje interfejsu z trasą domyślną.
 | `-i`, `--iface` | interfejs trasy domyślnej | interfejs do testów |
 | `-d`, `--duration` | `60` | czas nasłuchu pasywnego [s] |
 | `-t`, `--target` | `1.1.1.1` | cel testów internetu, MTU i traceroute |
+| `--interval` | `1.0` | co ile sekund linia statystyk na żywo (min. 0.2) |
+| `-q`, `--quiet` | — | bez podglądu na żywo, tylko raport |
 | `--passive-only` | — | tylko nasłuch, bez wysyłania pakietów |
 | `--force-scan` | — | skanuj ARP także podsieci większe niż /22 |
 | `--no-trace` | — | pomiń traceroute |
@@ -83,7 +102,7 @@ Kod wyjścia:
 Dzięki temu skrypt nadaje się do crona, np.:
 
 ```cron
-0 * * * * /opt/netcheck/netcheck.py -i eth0 -d 30 --no-color --json /var/log/netcheck.json > /dev/null || logger -t netcheck "problemy w sieci"
+0 * * * * /opt/netcheck/netcheck.py -i eth0 -d 30 -q --no-color --json /var/log/netcheck.json > /dev/null || logger -t netcheck "problemy w sieci"
 ```
 
 ## Uwagi
