@@ -30,6 +30,10 @@ Użycie:
     sudo ./netcheck.py -i eth0 -d 120 --json raport.json
     sudo ./netcheck.py -i eth0 --passive-only --interval 0.5
     sudo ./netcheck.py -i eth0 --quiet            # bez podglądu, tylko raport (np. cron)
+    sudo ./netcheck.py -i eth0 --log /var/log/netcheck.log
+
+Przerywanie: Ctrl+C = pomiń bieżący krok, 2× Ctrl+C w ciągu 2 s = zakończ i pokaż raport.
+Log: wszystko co na ekranie trafia od razu do pliku (domyślnie netcheck_<data>.log).
 
 Kod wyjścia: 0 = OK, 1 = ostrzeżenia, 2 = problemy krytyczne (przydatne w cronie).
 """
@@ -42,6 +46,7 @@ import logging
 import os
 import random
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -76,28 +81,92 @@ RESET = "\033[0m"
 # ---------------------------------------------------------------- konsola na żywo
 
 class Console:
-    """Bezpieczne wątkowo wypisywanie zdarzeń ze znacznikiem czasu."""
+    """Bezpieczne wątkowo wypisywanie zdarzeń ze znacznikiem czasu.
+    Każda linia trafia od razu (flush) także do pliku logu, jeśli jest otwarty."""
 
-    def __init__(self, enabled, color):
+    def __init__(self, enabled, color, logfile=None):
         self.enabled = enabled
         self.color = color
         self.lock = threading.Lock()
         self.last = time.time()
+        self.fh = None
+        if logfile:
+            self.fh = open(logfile, "a", encoding="utf-8", buffering=1)
+
+    def _file(self, text):
+        if self.fh:
+            try:
+                self.fh.write(text + "\n")
+                self.fh.flush()
+                os.fsync(self.fh.fileno())
+            except (OSError, ValueError):
+                pass
+
+    def out(self, text, screen=True):
+        """Zwykła linia (nagłówki, raport) – na ekran i do pliku."""
+        with self.lock:
+            if screen:
+                print(text, flush=True)
+            self._file(re.sub(r"\033\[[0-9;]*m", "", text))
 
     def log(self, msg, sev=None, dim=False):
-        if not self.enabled:
-            return
         now = time.time()
         ts = time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now % 1 * 10)}"
         tag = f"[{sev}] " if sev else ""
+        plain = f"{ts} {tag}{msg}"
         if self.color:
             if sev:
                 tag = COLORS[sev] + tag + RESET
             if dim:
                 msg = DIM + msg + RESET
         with self.lock:
-            print(f"{ts} {tag}{msg}", flush=True)
+            if self.enabled:
+                print(f"{ts} {tag}{msg}", flush=True)
+            self._file(plain)
             self.last = time.time()
+
+    def close(self):
+        if self.fh:
+            self.fh.close()
+            self.fh = None
+
+
+class CtrlC:
+    """Ctrl+C raz  = pomiń bieżący krok (nasłuch / test).
+    Ctrl+C dwa razy w ciągu `window` s = przerwij wszystko i pokaż raport.
+    Kolejne Ctrl+C po przerwaniu = natychmiastowe wyjście bez raportu."""
+
+    def __init__(self, window=2.0):
+        self.window = window
+        self.last = 0.0
+        self.abort = False
+        self.armed = False      # KeyboardInterrupt rzucamy tylko w trakcie kroku
+        self.hits = 0
+        signal.signal(signal.SIGINT, self._handler)
+
+    @staticmethod
+    def _say(text):
+        try:  # os.write jest bezpieczne w obsłudze sygnału (print może się zakleszczyć)
+            os.write(sys.stdout.fileno(), ("\n" + text + "\n").encode())
+        except OSError:
+            pass
+
+    def _handler(self, signum, frame):
+        now = time.time()
+        if self.abort:
+            self._say(">>> Ctrl+C — wyjście bez raportu (log zapisany do tego momentu)")
+            os._exit(130)
+        self.hits += 1
+        if now - self.last <= self.window:
+            self.abort = True
+            self._say(">>> Ctrl+C ×2 — przerywam wszystko i zapisuję raport "
+                      "(kolejne Ctrl+C = wyjście bez raportu)")
+        else:
+            self._say(f">>> Ctrl+C — pomijam bieżący krok (jeszcze raz w ciągu {self.window:.0f} s = koniec)")
+        self.last = now
+        if self.armed:
+            self.armed = False
+            raise KeyboardInterrupt
 
 
 class Heartbeat(threading.Thread):
@@ -145,20 +214,20 @@ class Report:
     def worst(self):
         return min((SEV_ORDER[f.sev] for f in self.items), default=3)
 
-    def print(self, color):
-        print("\n" + "=" * 72)
-        print(" WYNIKI")
-        print("=" * 72)
+    def print(self, con, color):
+        con.out("\n" + "=" * 72)
+        con.out(" WYNIKI  " + time.strftime("%Y-%m-%d %H:%M:%S"))
+        con.out("=" * 72)
         for f in sorted(self.items, key=lambda x: (SEV_ORDER[x.sev], x.area)):
             tag = f"[{f.sev:4}]"
             if color:
                 tag = COLORS[f.sev] + tag + RESET
-            print(f"{tag} {f.area:<10} {f.msg}")
+            con.out(f"{tag} {f.area:<10} {f.msg}")
             for d in f.details:
-                print(f"{'':18}- {d}")
+                con.out(f"{'':18}- {d}")
         c = Counter(f.sev for f in self.items)
-        print("-" * 72)
-        print(f" CRIT: {c['CRIT']}   WARN: {c['WARN']}   INFO: {c['INFO']}   OK: {c['OK']}")
+        con.out("-" * 72)
+        con.out(f" CRIT: {c['CRIT']}   WARN: {c['WARN']}   INFO: {c['INFO']}   OK: {c['OK']}")
 
 
 # ---------------------------------------------------------------- pomocnicze
@@ -263,17 +332,22 @@ def ping_live(target, count, interval, con, label, iface=None):
         except FileNotFoundError:
             con.log("brak polecenia ping", "WARN")
             break
-        for line in p.stdout:
-            out.append(line)
-            m = re.search(r"icmp_seq=(\d+).*time=([\d.]+) ms", line)
-            if m:
-                con.log(f"{label} {target}: seq={m.group(1)} {m.group(2)} ms", dim=True)
-            elif "no answer yet" in line:
-                s = re.search(r"icmp_seq=(\d+)", line)
-                con.log(f"{label} {target}: seq={s.group(1) if s else '?'} BRAK ODPOWIEDZI", "WARN")
-            elif re.search(r"Unreachable|exceeded|Redirect", line):
-                con.log(f"{label}: {line.strip()}", "WARN")
-        p.wait()
+        try:
+            for line in p.stdout:
+                out.append(line)
+                m = re.search(r"icmp_seq=(\d+).*time=([\d.]+) ms", line)
+                if m:
+                    con.log(f"{label} {target}: seq={m.group(1)} {m.group(2)} ms", dim=True)
+                elif "no answer yet" in line:
+                    s = re.search(r"icmp_seq=(\d+)", line)
+                    con.log(f"{label} {target}: seq={s.group(1) if s else '?'} BRAK ODPOWIEDZI", "WARN")
+                elif re.search(r"Unreachable|exceeded|Redirect", line):
+                    con.log(f"{label}: {line.strip()}", "WARN")
+            p.wait()
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
         if not any("invalid option" in l for l in out):
             break
     text = "".join(out)
@@ -870,6 +944,8 @@ def main():
     ap.add_argument("--loop-repeats", type=int, default=5, help="ile identycznych ramek = pętla (5)")
     ap.add_argument("--loop-window", type=float, default=1.0, help="okno wykrywania pętli [s] (1.0)")
     ap.add_argument("--json", help="zapisz raport do pliku JSON")
+    ap.add_argument("--log", help="plik logu (domyślnie netcheck_RRRRMMDD_GGMMSS.log w bieżącym katalogu)")
+    ap.add_argument("--no-log", action="store_true", help="nie zapisuj logu do pliku")
     ap.add_argument("--no-color", action="store_true")
     args = ap.parse_args()
     args.interval = max(0.2, args.interval)
@@ -893,15 +969,26 @@ def main():
     mac = get_if_hwaddr(iface).lower()
     gw = default_gw(iface)
     color = sys.stdout.isatty() and not args.no_color
-    con = Console(not args.quiet, color)
+    logfile = None if args.no_log else (args.log or time.strftime("netcheck_%Y%m%d_%H%M%S.log"))
+    try:
+        con = Console(not args.quiet, color, logfile)
+    except OSError as ex:
+        print(f"Nie mogę otworzyć pliku logu {logfile}: {ex} — kontynuuję bez logu")
+        logfile = None
+        con = Console(not args.quiet, color)
+    ctl = CtrlC()
     rep = Report()
 
-    print(f"Interfejs: {iface}  MAC: {mac}  IP: {cidr or 'brak'}  brama: {gw or 'brak'}")
+    con.out(f"NetCheck {time.strftime('%Y-%m-%d %H:%M:%S')}  {' '.join(sys.argv[1:])}")
+    con.out(f"Interfejs: {iface}  MAC: {mac}  IP: {cidr or 'brak'}  brama: {gw or 'brak'}")
+    if logfile:
+        con.out(f"Log zapisywany na bieżąco do: {os.path.abspath(logfile)}")
+    con.out("Ctrl+C = pomiń bieżący krok,  2× Ctrl+C w ciągu 2 s = zakończ i pokaż raport")
     s0 = read_stats(iface)
     t_begin = time.time()
 
     # --- faza 1: pasywna
-    print(f"\n=== FAZA 1: nasłuch pasywny ({args.duration} s, Ctrl+C = przejdź dalej) ===")
+    con.out(f"\n=== FAZA 1: nasłuch pasywny ({args.duration} s) ===")
     p = Passive(mac, own_ip, gw, args, con)
     sniffer = AsyncSniffer(iface=iface, prn=p.handle, store=False)
     sniffer.start()
@@ -918,7 +1005,8 @@ def main():
     t_prev = t_start
     next_t = t_start
     try:
-        while time.time() - t_start < args.duration:
+        ctl.armed = True
+        while time.time() - t_start < args.duration and not ctl.abort:
             next_t += args.interval
             time.sleep(max(0.0, next_t - time.time()))
             now = time.time()
@@ -927,15 +1015,17 @@ def main():
             prev_cnt, prev_stats = passive_tick(p, con, args, iface, now - t_start,
                                                 max(now - t_prev, 1e-3), prev_cnt, prev_stats)
             t_prev = now
+        ctl.armed = False
     except KeyboardInterrupt:
-        print("\nPrzerwano nasłuch — przechodzę dalej.")
+        ctl.armed = False
+        con.log("nasłuch przerwany przez użytkownika", "INFO")
     duration = max(1, int(time.time() - t_start))
     sniffer.stop()
     analyze_passive(p, rep, duration, t_start, own_ip, gw, args)
 
     # --- faza 2: aktywna
-    if not args.passive_only:
-        print("\n=== FAZA 2: testy aktywne ===")
+    if not args.passive_only and not ctl.abort:
+        con.out("\n=== FAZA 2: testy aktywne ===")
         hb = Heartbeat(con, args.interval)
         if not args.quiet:
             hb.start()
@@ -951,35 +1041,52 @@ def main():
                   ("Path MTU", lambda: internet["ok"] and check_pmtu(args.target, rep, con, hb))]
         if not args.no_trace:
             steps.append(("traceroute", lambda: check_routing_loop(args.target, rep, con, hb)))
+        skipped = []
         for n, (name, fn) in enumerate(steps, 1):
-            if not args.quiet:
-                print(f"--- test {n}/{len(steps)}: {name}", flush=True)
+            if ctl.abort:
+                skipped.append(name)
+                continue
+            con.out(f"--- test {n}/{len(steps)}: {name}", screen=not args.quiet)
             hb.begin(name)
             s_before = read_stats(iface)
+            hits_before = ctl.hits
             try:
+                ctl.armed = True
                 fn()
+                ctl.armed = False
             except KeyboardInterrupt:
-                con.log(f"{name}: przerwano", "INFO")
-                rep.add("INFO", name, "Przerwano przez użytkownika")
+                ctl.armed = False
             except Exception as ex:  # noqa: BLE001
+                ctl.armed = False
                 con.log(f"{name}: test nie powiódł się ({ex})", "INFO")
                 rep.add("INFO", name, f"Test nie powiódł się: {ex}")
+            if ctl.hits != hits_before:  # scapy potrafi sam połknąć KeyboardInterrupt
+                con.log(f"{name}: przerwano (wynik częściowy)", "INFO")
+                rep.add("INFO", name, "Przerwano przez użytkownika — wynik częściowy")
             hb.end()
             report_stat_changes(con, s_before, read_stats(iface))
         hb.stop()
+        if skipped:
+            rep.add("INFO", "skrypt", "Pominięte testy (przerwano 2× Ctrl+C)", skipped)
 
+    if ctl.abort:
+        con.log("test przerwany (2× Ctrl+C) — raport z tego, co zebrano", "INFO")
+        rep.add("INFO", "skrypt", "Test przerwany przez użytkownika (2× Ctrl+C) — wyniki niepełne")
     analyze_iface(iface, s0, read_stats(iface), time.time() - t_begin, rep)
     if p.errors:
         rep.add("INFO", "skrypt", f"{p.errors} ramek nie udało się przeanalizować")
 
-    rep.print(color)
+    rep.print(con, color)
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "iface": iface, "ip": str(cidr),
                        "gateway": gw, "findings": [asdict(f) for f in rep.items]},
                       fh, ensure_ascii=False, indent=2)
-        print(f"Raport JSON: {args.json}")
+        con.out(f"Raport JSON: {args.json}")
+    if logfile:
+        con.out(f"Log: {os.path.abspath(logfile)}")
+    con.close()
 
     sys.exit({0: 2, 1: 1}.get(rep.worst(), 0))
 

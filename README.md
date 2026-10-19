@@ -40,6 +40,24 @@ W trakcie działania skrypt na bieżąco pokazuje, co się dzieje:
 
 `-q` / `--quiet` wyłącza podgląd (zostaje tylko raport końcowy) — przydatne w cronie.
 
+### Przerywanie
+
+| Klawisze | Efekt |
+|---|---|
+| `Ctrl+C` | pomija bieżący krok — w fazie 1 kończy nasłuch i przechodzi do testów aktywnych, w fazie 2 przerywa bieżący test (wynik częściowy) i przechodzi do następnego |
+| `Ctrl+C` 2× w ciągu 2 s | przerywa wszystko, pozostałe testy pomija i od razu pokazuje oraz zapisuje raport z tego, co zebrano |
+| kolejne `Ctrl+C` po przerwaniu | natychmiastowe wyjście bez raportu (log zostaje zapisany do tego momentu) |
+
+### Zapis do pliku
+
+Wszystko, co pojawia się na ekranie (podgląd na żywo i raport końcowy), jest od razu zapisywane do pliku logu — każda linia trafia na dysk w chwili wypisania, więc log zostaje także po przerwaniu, zawieszeniu czy utracie sesji SSH. Plik logu nie zawiera kolorów.
+
+- domyślnie: `netcheck_RRRRMMDD_GGMMSS.log` w bieżącym katalogu,
+- `--log PLIK` — własna ścieżka (dopisuje na końcu istniejącego pliku),
+- `--no-log` — bez pliku logu.
+
+Z `-q` log nadal zawiera pełny przebieg testu, mimo że na ekranie widać tylko raport.
+
 ### Opcje
 
 | Opcja | Domyślnie | Opis |
@@ -57,6 +75,8 @@ W trakcie działania skrypt na bieżąco pokazuje, co się dzieje:
 | `--loop-repeats` | `5` | ile identycznych ramek w oknie oznacza pętlę |
 | `--loop-window` | `1.0` | okno wykrywania pętli [s] |
 | `--json PLIK` | — | zapisz raport do JSON |
+| `--log PLIK` | `netcheck_<data>.log` | plik logu zapisywany na bieżąco |
+| `--no-log` | — | nie zapisuj logu |
 | `--no-color` | — | wyłącz kolory |
 
 ## Co sprawdza
@@ -102,7 +122,7 @@ Kod wyjścia:
 Dzięki temu skrypt nadaje się do crona, np.:
 
 ```cron
-0 * * * * /opt/netcheck/netcheck.py -i eth0 -d 30 -q --no-color --json /var/log/netcheck.json > /dev/null || logger -t netcheck "problemy w sieci"
+0 * * * * /opt/netcheck/netcheck.py -i eth0 -d 30 -q --no-color --log /var/log/netcheck.log --json /var/log/netcheck.json > /dev/null || logger -t netcheck "problemy w sieci"
 ```
 
 ## Uwagi
