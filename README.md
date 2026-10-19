@@ -1,6 +1,6 @@
 # NetCheck
 
-Skrypt diagnostyczny sieci LAN dla Linuksa (np. Raspberry Pi). Wykrywa pętle L2, burze broadcastowe, problemy ze STP, nieautoryzowane serwery DHCP / routery IPv6, konflikty IP, problemy z MTU, DNS i pętle routingu.
+Skrypt diagnostyczny sieci LAN dla Linuksa (np. Raspberry Pi). Wykrywa pętle L2, burze broadcastowe, problemy ze STP, nieautoryzowane serwery DHCP / routery IPv6, konflikty IP, problemy z MTU, DNS i pętle routingu. Na interfejsie Wi-Fi dodatkowo monitoruje jakość łącza radiowego i analizuje kanał oraz otoczenie.
 
 ## Wymagania
 
@@ -8,6 +8,7 @@ Skrypt diagnostyczny sieci LAN dla Linuksa (np. Raspberry Pi). Wykrywa pętle L2
 - Python 3.8+
 - [scapy](https://scapy.net/) 2.5 lub nowszy
 - `iputils-ping`, `iproute2`
+- dla Wi-Fi: `iw` (`sudo apt install iw`) — bez niego tylko podstawowe dane z `/proc/net/wireless`
 
 ```bash
 pip install scapy        # albo: sudo apt install python3-scapy
@@ -70,8 +71,9 @@ Z `-q` log nadal zawiera pełny przebieg testu, mimo że na ekranie widać tylko
 | `--passive-only` | — | tylko nasłuch, bez wysyłania pakietów |
 | `--force-scan` | — | skanuj ARP także podsieci większe niż /22 |
 | `--no-trace` | — | pomiń traceroute |
-| `--storm-warn` | `300` | próg WARN dla broadcastu [pps] |
-| `--storm-crit` | `2000` | próg CRIT dla broadcastu [pps] |
+| `--storm-warn` | `300` / Wi-Fi `100` | próg WARN dla broadcastu [pps] |
+| `--storm-crit` | `2000` / Wi-Fi `1000` | próg CRIT dla broadcastu [pps] |
+| `--no-wifi-scan` | — | Wi-Fi: bez aktywnego skanu otoczenia |
 | `--loop-repeats` | `5` | ile identycznych ramek w oknie oznacza pętlę |
 | `--loop-window` | `1.0` | okno wykrywania pętli [s] |
 | `--json PLIK` | — | zapisz raport do JSON |
@@ -90,6 +92,30 @@ Z `-q` log nadal zawiera pełny przebieg testu, mimo że na ekranie widać tylko
 - **DHCP:** więcej niż jeden serwer DHCP (rogue DHCP).
 - **IPv6 RA:** więcej niż jeden router ogłaszający się (rogue RA).
 - **LLDP:** lista sąsiadów (informacyjnie).
+
+### Wi-Fi (wykrywane automatycznie)
+
+Na żywo, co takt, w linii statystyk i jako zdarzenia:
+
+- sygnał (dBm) i zdarzenie przy przejściu progu jakości (-60 / -67 / -75 / -82 dBm),
+- prędkość łącza, odsetek retransmisji (alarm przy ≥30%),
+- utracone beacony AP, ramki niewysłane mimo retransmisji,
+- roaming między punktami dostępowymi, rozłączenia i ponowne połączenia.
+
+Monitor działa także w fazie aktywnej, więc widać np. czy straty pingu zbiegają się ze spadkiem sygnału.
+
+Analiza łącza i otoczenia (pierwszy test fazy aktywnej):
+
+- SSID, BSSID, pasmo, kanał, szerokość kanału, standard (Wi-Fi 4/5/6/7, legacy a/b/g),
+- zajętość kanału (airtime) i szum / SNR — jeśli sterownik to udostępnia,
+- oszczędzanie energii (powoduje skoki opóźnień), brak ustawionego kraju (domena `00`),
+- skan sieci w okolicy: sieci na tym samym kanale, nakładające się kanały w 2.4 GHz, kanał spoza 1/6/11, propozycja mniej zajętych kanałów,
+- ta sama sieć z silniejszym AP (sticky client), dostępność w 5 GHz,
+- ta sama nazwa sieci z różnymi zabezpieczeniami (możliwy evil twin), sieć otwarta.
+
+Na Wi-Fi progi są dopasowane: broadcast WARN od 100 pps i CRIT od 1000 pps (broadcast idzie najniższą prędkością i zjada czas antenowy wszystkim), opóźnienie do bramy WARN dopiero od 30 ms średnio lub 20 ms jittera, a brak BPDU jest traktowany jako normalny.
+
+Skan otoczenia wysyła zapytania próbkujące (probe request) i na kilka sekund może zwiększyć opóźnienie. `--no-wifi-scan` lub `--passive-only` używa tylko wyników skanu z pamięci sterownika.
 
 ### Faza 2 — aktywna
 
@@ -127,7 +153,7 @@ Dzięki temu skrypt nadaje się do crona, np.:
 
 ## Uwagi
 
-- Testy pętli i STP mają sens tylko na połączeniu kablowym. Przez Wi-Fi interfejs widzi niewielką część ruchu L2.
+- Przez Wi-Fi pętle i burze z sieci przewodowej są widoczne, bo broadcast dociera do klientów Wi-Fi. STP i błędy kabla dotyczą jednak tylko sieci kablowej — do jej pełnej diagnozy uruchom test także po kablu.
 - Przy prawdziwej burzy broadcastowej Python może nie nadążać z analizą ramek. Wynik i tak wskaże problem, ale liczby pps mogą być zaniżone.
 - Faza aktywna wysyła DHCP DISCOVER i skanuje ARP. Port security, DHCP snooping i systemy IDS mogą na to zareagować. W cudzej sieci zacznij od `--passive-only` albo uzgodnij test z administratorem.
 - Kilka MAC dla jednego IP bywa poprawne (VRRP/HSRP, proxy ARP). Takie wyniki trzeba zweryfikować ręcznie.

@@ -18,6 +18,10 @@ netcheck.py — diagnostyka sieci LAN pod kątem typowych problemów, z podgląd
     * Path MTU, DNS, traceroute z wykrywaniem pętli routingu
   Zawsze:
     * liczniki błędów interfejsu (CRC, drop, kolizje), duplex, flapy linku
+  Wi-Fi (automatycznie, wymaga iw):
+    * na żywo: sygnał, prędkość, retransmisje, beacony, roaming, rozłączenia
+    * zajętość kanału, szum/SNR, power save, domena regulacyjna
+    * skan otoczenia: wspólne i nakładające się kanały, lepszy AP, evil twin
 
 Podgląd na żywo: co sekundę (lub co --interval) linia ze statystykami ruchu,
 a każde istotne zdarzenie (pętla, BPDU TC, nowy serwer DHCP, konflikt ARP,
@@ -534,7 +538,7 @@ class Passive:
             self.lldp[src] = name
 
 
-def passive_tick(p, con, args, iface, elapsed, dt, prev_cnt, prev_stats):
+def passive_tick(p, con, args, iface, elapsed, dt, prev_cnt, prev_stats, mon=None):
     """Jedna linia statystyk na takt + zdarzenia z liczników interfejsu."""
     cur = dict(p.cnt)
     rate = {k: (cur.get(k, 0) - prev_cnt.get(k, 0)) / dt for k in
@@ -552,6 +556,10 @@ def passive_tick(p, con, args, iface, elapsed, dt, prev_cnt, prev_stats):
     if srcs:
         mac, n = srcs.most_common(1)[0]
         line += f" | top bcast: {mac} ({n / dt:.0f}/s)"
+    if mon is not None:
+        w = mon.poll()
+        if w:
+            line += f" | {w}"
     if sev == "CRIT":
         line += "  << BURZA BROADCASTOWA"
     con.log(line, sev, dim=sev is None)
@@ -581,7 +589,9 @@ def analyze_passive(p, rep, duration, t_start, own_ip, gw, args):
         rep.add("OK", "pętla L2", "Nie wykryto krążących (powtarzających się) ramek")
 
     if b_max >= args.storm_crit:
-        rep.add("CRIT", "broadcast", f"Burza broadcastowa: szczyt {b_max} pps", top)
+        rep.add("CRIT", "broadcast", f"Burza broadcastowa: szczyt {b_max} pps"
+                + (" — na Wi-Fi broadcast idzie najniższą prędkością i zjada czas antenowy wszystkim"
+                   if getattr(args, "wireless", False) else ""), top)
     elif b_max >= args.storm_warn:
         rep.add("WARN", "broadcast", f"Wysoki ruch broadcast: szczyt {b_max} pps", top)
     else:
@@ -590,7 +600,9 @@ def analyze_passive(p, rep, duration, t_start, own_ip, gw, args):
         rep.add("WARN", "multicast", f"Bardzo wysoki ruch multicast: szczyt {m_max} pps "
                 "(brak IGMP snooping? strumień wideo?)")
 
-    if p.stp_bpdus == 0:
+    if p.stp_bpdus == 0 and getattr(args, "wireless", False):
+        rep.add("INFO", "STP", "Brak BPDU — na Wi-Fi to normalne (punkty dostępowe zwykle ich nie przekazują)")
+    elif p.stp_bpdus == 0:
         rep.add("INFO", "STP", "Brak BPDU na porcie — STP wyłączone, filtrowane (BPDU filter) "
                 "albo switch niezarządzalny. Pętla nie zostanie automatycznie zablokowana.")
     else:
@@ -751,7 +763,7 @@ def dhcp_discover(iface, mac, rep, passive_servers, con, hb):
         rep.add("INFO", "DHCP", "Brak odpowiedzi na DHCP DISCOVER (sieć statyczna lub DHCP snooping?)")
 
 
-def check_gateway(iface, gw, rep, con, hb):
+def check_gateway(iface, gw, rep, con, hb, wireless=False):
     if not gw:
         con.log("brak trasy domyślnej", "CRIT")
         rep.add("CRIT", "brama", "Brak trasy domyślnej")
@@ -765,8 +777,9 @@ def check_gateway(iface, gw, rep, con, hb):
         rep.add("CRIT", "brama", "Duże straty do bramy — " + desc)
     elif r["loss"] > 0:
         rep.add("WARN", "brama", "Straty do bramy — " + desc)
-    elif r["avg"] > 10 or r["mdev"] > 5:
-        rep.add("WARN", "brama", "Wysokie opóźnienie/jitter w LAN — " + desc)
+    elif (r["avg"] > 30 or r["mdev"] > 20) if wireless else (r["avg"] > 10 or r["mdev"] > 5):
+        rep.add("WARN", "brama", "Wysokie opóźnienie/jitter w LAN — " + desc
+                + (" (Wi-Fi: sprawdź sygnał, zajętość kanału i oszczędzanie energii)" if wireless else ""))
     else:
         rep.add("OK", "brama", desc)
 
@@ -892,6 +905,486 @@ def check_routing_loop(target, rep, con, hb, maxttl=30):
         rep.add("INFO", "routing", f"Cel {target} nie odpowiedział w {maxttl} hopach", [trace])
 
 
+# ---------------------------------------------------------------- Wi-Fi
+
+SIGNAL_TH = (-60, -67, -75, -82)
+SIGNAL_DESC = ["bardzo dobry", "dobry", "słaby — możliwe spadki prędkości",
+               "zły — zrywanie i duże straty", "krytycznie słaby"]
+CH_5GHZ_EU = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140]
+
+
+def is_wireless(iface):
+    return (os.path.exists(f"/sys/class/net/{iface}/wireless")
+            or os.path.exists(f"/sys/class/net/{iface}/phy80211"))
+
+
+def have_iw():
+    rc, _ = run(["iw", "--version"], 5)
+    return rc == 0
+
+
+def _num(s):
+    m = re.search(r"-?\d+(?:\.\d+)?", str(s)) if s is not None else None
+    return float(m.group()) if m else None
+
+
+def freq_to_channel(f):
+    if f is None:
+        return None
+    f = int(round(float(f)))
+    if f == 2484:
+        return 14
+    if 2412 <= f <= 2472:
+        return (f - 2407) // 5
+    if 5000 < f < 5925:
+        return (f - 5000) // 5
+    if 5925 <= f <= 7125:
+        return (f - 5950) // 5
+    return None
+
+
+def band_of(f):
+    if f is None:
+        return "?"
+    return "2.4 GHz" if f < 3000 else ("5 GHz" if f < 5925 else "6 GHz")
+
+
+def signal_level(dbm):
+    for i, th in enumerate(SIGNAL_TH):
+        if dbm >= th:
+            return i
+    return len(SIGNAL_TH)
+
+
+def wifi_standard(rate_str):
+    s = rate_str or ""
+    if "EHT" in s:
+        return "Wi-Fi 7 (802.11be)"
+    if "HE-" in s:
+        return "Wi-Fi 6/6E (802.11ax)"
+    if "VHT" in s:
+        return "Wi-Fi 5 (802.11ac)"
+    if "MCS" in s:
+        return "Wi-Fi 4 (802.11n)"
+    return "starszy standard 802.11a/b/g" if s else "?"
+
+
+def _kv(lines):
+    d = {}
+    for line in lines:
+        if ":" in line:
+            k, v = line.strip().split(":", 1)
+            d[k.strip().lower()] = v.strip()
+    return d
+
+
+def wifi_link(iface):
+    rc, out = run(["iw", "dev", iface, "link"], 5)
+    if rc != 0:
+        return None
+    if "Not connected" in out:
+        return {"connected": False}
+    m = re.search(r"Connected to ([0-9a-f:]{17})", out, re.I)
+    d = _kv(out.splitlines()[1:])
+    d["connected"] = True
+    d["bssid"] = m.group(1).lower() if m else None
+    return d
+
+
+def wifi_station(iface, bssid):
+    rc, out = run(["iw", "dev", iface, "station", "dump"], 5)
+    if rc != 0:
+        return {}
+    for block in re.split(r"^Station ", out, flags=re.M):
+        if not block.strip():
+            continue
+        mac = block.split()[0].lower()
+        if bssid and mac != bssid:
+            continue
+        d = _kv(block.splitlines()[1:])
+        d["mac"] = mac
+        return d
+    return {}
+
+
+def wifi_proc(iface):
+    """Awaryjnie, bez iw: /proc/net/wireless."""
+    try:
+        with open("/proc/net/wireless") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return {}
+    for line in lines[2:]:
+        if line.strip().startswith(iface + ":"):
+            f = line.split(":", 1)[1].split()
+            if len(f) >= 10:
+                return {"level": _num(f[2]), "noise": _num(f[3]), "retry": _num(f[7]),
+                        "missed_beacon": _num(f[9])}
+    return {}
+
+
+def wifi_survey(iface):
+    rc, out = run(["iw", "dev", iface, "survey", "dump"], 5)
+    if rc != 0:
+        return None
+    for block in out.split("Survey data from")[1:]:
+        if "[in use]" in block:
+            return {k: _num(v) for k, v in _kv(block.splitlines()[1:]).items()}
+    return None
+
+
+def wifi_scan_parse(out):
+    nets, cur = [], None
+    for line in out.splitlines():
+        m = re.match(r"BSS ([0-9a-f:]{17})", line, re.I)
+        if m:
+            cur = {"bssid": m.group(1).lower(), "ssid": "", "freq": None, "signal": None,
+                   "sec": set(), "privacy": False, "assoc": "associated" in line}
+            nets.append(cur)
+            continue
+        if cur is None:
+            continue
+        t = line.strip()
+        if t.startswith("freq:"):
+            cur["freq"] = _num(t)
+        elif t.startswith("signal:"):
+            cur["signal"] = _num(t)
+        elif t.startswith("SSID:"):
+            cur["ssid"] = t[5:].strip()
+        elif t.startswith("RSN:"):
+            cur["sec"].add("WPA2/WPA3")
+        elif t.startswith("WPA:"):
+            cur["sec"].add("WPA")
+        elif t.startswith("capability:") and "Privacy" in t:
+            cur["privacy"] = True
+    for n in nets:
+        n["security"] = "+".join(sorted(n["sec"])) or ("WEP" if n["privacy"] else "otwarta")
+        n["ch"] = freq_to_channel(n["freq"])
+        n["band"] = band_of(n["freq"])
+        n["ssid"] = n["ssid"] if n["ssid"] and not n["ssid"].startswith("\\x00") else ""
+        del n["sec"]
+    return nets
+
+
+class WifiMonitor:
+    """Próbkuje łącze Wi-Fi co takt: sygnał, bitrate, retry, beacon loss, roaming, rozłączenia."""
+
+    def __init__(self, iface, con):
+        self.iface, self.con = iface, con
+        self.iw = have_iw()
+        self.prev = None
+        self.lock = threading.Lock()
+        self.signals, self.retry_pcts, self.bitrates = [], [], []
+        self.roams, self.disconnects = [], 0
+        self.beacon_loss = self.tx_failed = 0
+        self.ssid = self.bssid = self.freq = None
+        self.last_level = None
+        self.high_retry = False
+        self._watch = None
+        self._watch_stop = threading.Event()
+
+    def sample(self):
+        s = {"t": time.time()}
+        if self.iw:
+            link = wifi_link(self.iface)
+            if link is None:
+                return None
+            if not link.get("connected"):
+                s["connected"] = False
+                return s
+            s.update(connected=True, bssid=link.get("bssid"), ssid=link.get("ssid"),
+                     freq=_num(link.get("freq")), signal=_num(link.get("signal")),
+                     tx_rate=_num(link.get("tx bitrate")), rx_rate=_num(link.get("rx bitrate")))
+            st = wifi_station(self.iface, s["bssid"])
+            for key, name in (("tx packets", "tx_packets"), ("tx retries", "tx_retries"),
+                              ("tx failed", "tx_failed"), ("beacon loss", "beacon_loss")):
+                v = _num(st.get(key))
+                if v is not None:
+                    s[name] = v
+            if s.get("signal") is None:
+                s["signal"] = _num(st.get("signal avg"))
+        else:
+            pr = wifi_proc(self.iface)
+            if not pr:
+                return None
+            s.update(connected=True, signal=pr["level"], missed_beacon=pr["missed_beacon"])
+        return s
+
+    def poll(self):
+        """Weź próbkę, wypisz zdarzenia, zwróć skrót do linii statystyk."""
+        with self.lock:
+            return self._poll()
+
+    def _poll(self):
+        s = self.sample()
+        if s is None:
+            return ""
+        prev, self.prev = self.prev, s
+        con = self.con
+        if not s.get("connected"):
+            if prev is None or prev.get("connected"):
+                self.disconnects += 1
+                con.log("Wi-Fi: ROZŁĄCZONO z siecią", "CRIT")
+            return "Wi-Fi: BRAK POŁĄCZENIA"
+        if prev is not None and not prev.get("connected"):
+            con.log(f"Wi-Fi: połączono ponownie z „{s.get('ssid')}” ({s.get('bssid')})", "WARN")
+        if (prev and prev.get("connected") and s.get("bssid") and prev.get("bssid")
+                and s["bssid"] != prev["bssid"]):
+            self.roams.append((time.strftime("%H:%M:%S"), prev["bssid"], s["bssid"]))
+            con.log(f"Wi-Fi: ROAMING {prev['bssid']} (kanał {freq_to_channel(prev.get('freq'))}, "
+                    f"{prev.get('signal')} dBm) → {s['bssid']} (kanał {freq_to_channel(s.get('freq'))}, "
+                    f"{s.get('signal')} dBm)", "WARN")
+            self.last_level = None
+        self.ssid, self.bssid, self.freq = s.get("ssid"), s.get("bssid"), s.get("freq")
+        parts = []
+        sig = s.get("signal")
+        if sig is not None:
+            self.signals.append(sig)
+            lvl = signal_level(sig)
+            if self.last_level is not None and lvl != self.last_level:
+                worse = lvl > self.last_level
+                con.log(f"Wi-Fi: sygnał {'spadł' if worse else 'poprawił się'} do {sig:.0f} dBm — "
+                        f"{SIGNAL_DESC[lvl]}", "WARN" if worse and lvl >= 2 else "INFO")
+            self.last_level = lvl
+            parts.append(f"{sig:.0f} dBm")
+        if s.get("tx_rate"):
+            self.bitrates.append(s["tx_rate"])
+            parts.append(f"tx {s['tx_rate']:.0f} Mb/s")
+        if prev and prev.get("connected") and prev.get("bssid") == s.get("bssid"):
+            dp = s.get("tx_packets", 0) - prev.get("tx_packets", 0)
+            dr = s.get("tx_retries", 0) - prev.get("tx_retries", 0)
+            if "tx_retries" in s and dp >= 20 and dr >= 0:
+                pct = 100 * dr / (dp + dr)
+                self.retry_pcts.append(pct)
+                parts.append(f"retry {pct:.0f}%")
+                if pct >= 30 and not self.high_retry:
+                    con.log(f"Wi-Fi: dużo retransmisji ({pct:.0f}%) — zakłócenia, zatłoczony kanał "
+                            "lub słaby sygnał", "WARN")
+                self.high_retry = pct >= 30
+            for key, label in (("tx_failed", "nieudane wysyłki"), ("beacon_loss", "utracone beacony AP"),
+                               ("missed_beacon", "utracone beacony AP")):
+                if key in s and key in prev:
+                    d = s[key] - prev[key]
+                    if d > 0:
+                        if key == "tx_failed":
+                            self.tx_failed += d
+                        else:
+                            self.beacon_loss += d
+                        con.log(f"Wi-Fi: {label} +{d:.0f}", "WARN")
+        return "Wi-Fi " + " ".join(parts) if parts else ""
+
+    # --- obserwacja w tle (faza aktywna): tylko zdarzenia
+    def start_watch(self, interval):
+        self._watch_stop.clear()
+
+        def loop():
+            while not self._watch_stop.wait(interval):
+                try:
+                    self.poll()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._watch = threading.Thread(target=loop, daemon=True)
+        self._watch.start()
+
+    def stop_watch(self):
+        self._watch_stop.set()
+
+
+def analyze_wifi_monitor(mon, rep):
+    if mon.signals:
+        avg = sum(mon.signals) / len(mon.signals)
+        lo, hi = min(mon.signals), max(mon.signals)
+        lvl = signal_level(avg)
+        sev = "OK" if lvl <= 1 else ("WARN" if lvl <= 3 else "CRIT")
+        rep.add(sev, "Wi-Fi", f"Sygnał w czasie testu: śr. {avg:.0f} dBm (min {lo:.0f}, max {hi:.0f}) — "
+                f"{SIGNAL_DESC[lvl]}")
+        if hi - lo >= 15:
+            rep.add("WARN", "Wi-Fi", f"Sygnał mocno się wahał ({hi - lo:.0f} dB) — przeszkody, ruch ludzi, "
+                    "zmiana anteny/kierunku, zakłócenia")
+    if mon.retry_pcts:
+        avg = sum(mon.retry_pcts) / len(mon.retry_pcts)
+        mx = max(mon.retry_pcts)
+        sev = "WARN" if avg >= 15 or mx >= 50 else "OK"
+        rep.add(sev, "Wi-Fi", f"Retransmisje: śr. {avg:.0f}%, max {mx:.0f}%"
+                + (" — kanał zakłócony/zatłoczony lub zbyt słaby sygnał" if sev == "WARN" else ""))
+    if mon.bitrates:
+        rep.add("INFO", "Wi-Fi", f"Prędkość łącza tx: śr. {sum(mon.bitrates) / len(mon.bitrates):.0f} Mb/s "
+                f"(min {min(mon.bitrates):.0f}, max {max(mon.bitrates):.0f})")
+    if mon.disconnects:
+        rep.add("CRIT", "Wi-Fi", f"Rozłączenia z siecią w czasie testu: {mon.disconnects}")
+    if mon.roams:
+        rep.add("WARN" if len(mon.roams) > 2 else "INFO", "Wi-Fi",
+                f"Roaming między AP: {len(mon.roams)}×", [f"{t}: {a} → {b}" for t, a, b in mon.roams])
+    if mon.beacon_loss:
+        rep.add("WARN", "Wi-Fi", f"Utracone beacony AP: {mon.beacon_loss:.0f} — słaby sygnał lub zakłócenia")
+    if mon.tx_failed:
+        rep.add("WARN" if mon.tx_failed > 10 else "INFO", "Wi-Fi",
+                f"Ramki niewysłane mimo retransmisji: {mon.tx_failed:.0f}")
+
+
+def check_wifi_env(iface, mon, rep, con, hb, scan_mode):
+    """scan_mode: 'scan' (aktywny skan), 'dump' (tylko wyniki z pamięci sterownika), None."""
+    if not mon.iw:
+        con.log("Wi-Fi: brak narzędzia iw — tylko podstawowe dane (sudo apt install iw)", "WARN")
+        rep.add("INFO", "Wi-Fi", "Brak narzędzia iw — ograniczona diagnostyka Wi-Fi (sudo apt install iw)")
+        return
+    link = wifi_link(iface)
+    if not link or not link.get("connected"):
+        con.log("Wi-Fi: interfejs nie jest połączony z żadną siecią", "CRIT")
+        rep.add("CRIT", "Wi-Fi", "Interfejs nie jest połączony z żadną siecią Wi-Fi")
+        return
+    ssid, bssid = link.get("ssid", "?"), link.get("bssid")
+    freq = _num(link.get("freq"))
+    ch, band = freq_to_channel(freq), band_of(freq)
+    sig = _num(link.get("signal"))
+    txs, rxs = link.get("tx bitrate", "?"), link.get("rx bitrate", "?")
+    width = re.search(r"(\d+)MHz", txs)
+    std = wifi_standard(txs)
+    lvl = signal_level(sig) if sig is not None else 0
+    con.log(f"Wi-Fi: „{ssid}” {bssid}, {band} kanał {ch} ({freq:.0f} MHz), sygnał {sig} dBm, {std}")
+    con.log(f"Wi-Fi: tx {txs}", dim=True)
+    con.log(f"Wi-Fi: rx {rxs}", dim=True)
+    rep.add("OK" if lvl <= 1 else ("WARN" if lvl <= 3 else "CRIT"), "Wi-Fi",
+            f"Połączono z „{ssid}” ({bssid}), {band}, kanał {ch}"
+            f"{', szerokość ' + width.group(1) + ' MHz' if width else ''}, sygnał {sig:.0f} dBm — {SIGNAL_DESC[lvl]}",
+            [f"standard: {std}", f"tx: {txs}", f"rx: {rxs}",
+             f"DTIM {link.get('dtim period', '?')}, beacon co {link.get('beacon int', '?')} TU"])
+    if "802.11a/b/g" in std:
+        rep.add("WARN", "Wi-Fi", "Połączenie w starym standardzie 802.11a/b/g — niska przepustowość "
+                "(stary router/karta lub wymuszony tryb legacy)")
+    if band == "2.4 GHz":
+        rep.add("INFO", "Wi-Fi", "Pasmo 2.4 GHz — większy zasięg, ale zwykle zatłoczone i wolniejsze niż 5 GHz")
+
+    # oszczędzanie energii
+    _, ps = run(["iw", "dev", iface, "get", "power_save"], 5)
+    if re.search(r"Power save:\s*on", ps):
+        con.log("Wi-Fi: oszczędzanie energii WŁĄCZONE", "INFO")
+        rep.add("INFO", "Wi-Fi", "Oszczędzanie energii Wi-Fi włączone — może powodować skoki opóźnień "
+                f"i jitter (wyłączenie: sudo iw dev {iface} set power_save off)")
+
+    # domena regulacyjna
+    _, reg = run(["iw", "reg", "get"], 5)
+    m = re.search(r"country (\w\w)", reg)
+    if m and m.group(1) == "00":
+        con.log("Wi-Fi: nie ustawiono kraju (domena 00)", "WARN")
+        rep.add("WARN", "Wi-Fi", "Nie ustawiono kraju Wi-Fi (domena 00) — ograniczone kanały i moc "
+                "(sudo iw reg set PL, na Raspberry Pi: raspi-config → Localisation → WLAN Country)")
+    elif m:
+        rep.add("INFO", "Wi-Fi", f"Domena regulacyjna: {m.group(1)}")
+
+    # zajętość kanału i szum
+    hb.status = "pomiar zajętości kanału"
+    s1 = wifi_survey(iface)
+    time.sleep(2)
+    s2 = wifi_survey(iface)
+    noise = (s2 or s1 or {}).get("noise")
+    if s1 and s2 and s2.get("channel active time") is not None and s2.get("channel busy time") is not None:
+        da = s2["channel active time"] - s1.get("channel active time", 0)
+        db = s2["channel busy time"] - s1.get("channel busy time", 0)
+        if da <= 0:
+            da, db = s2["channel active time"], s2["channel busy time"]
+        if da > 0:
+            busy = 100 * db / da
+            sev = "CRIT" if busy >= 80 else ("WARN" if busy >= 50 else "OK")
+            con.log(f"Wi-Fi: zajętość kanału {ch}: {busy:.0f}%", None if sev == "OK" else sev)
+            rep.add(sev, "Wi-Fi", f"Zajętość kanału {ch} (airtime): {busy:.0f}%"
+                    + (" — kanał przeciążony, rozważ zmianę kanału" if sev != "OK" else ""))
+    if noise is not None and sig is not None:
+        snr = sig - noise
+        sev = "CRIT" if snr < 10 else ("WARN" if snr < 20 else "OK")
+        con.log(f"Wi-Fi: szum {noise:.0f} dBm, SNR {snr:.0f} dB", None if sev == "OK" else sev)
+        rep.add(sev, "Wi-Fi", f"Szum {noise:.0f} dBm, SNR {snr:.0f} dB"
+                + (" — za mało dla stabilnego łącza" if sev != "OK" else ""))
+    elif s1 is None:
+        rep.add("INFO", "Wi-Fi", "Sterownik nie udostępnia pomiaru zajętości kanału / szumu (survey)")
+
+    # otoczenie
+    if not scan_mode:
+        return
+    if scan_mode == "scan":
+        con.log("Wi-Fi: skanuję otoczenie (kilka sekund, opóźnienie może chwilowo wzrosnąć)…")
+        hb.status = "skan sieci"
+        rc, out = run(["iw", "dev", iface, "scan"], 30)
+        if rc != 0 or "BSS " not in out:
+            con.log("Wi-Fi: aktywny skan niedostępny (zajęty interfejs?) — używam wyników z pamięci", "INFO")
+            rc, out = run(["iw", "dev", iface, "scan", "dump"], 10)
+    else:
+        rc, out = run(["iw", "dev", iface, "scan", "dump"], 10)
+    nets = wifi_scan_parse(out) if rc == 0 else []
+    if not nets:
+        rep.add("INFO", "Wi-Fi", "Brak wyników skanu sieci" + (" (tryb pasywny: tylko pamięć sterownika)"
+                                                               if scan_mode == "dump" else ""))
+        return
+    for n in sorted(nets, key=lambda x: x["signal"] or -999, reverse=True):
+        mine = "  ← połączony" if n["bssid"] == bssid else ""
+        con.log(f"  {n['ssid'] or '<ukryta>':<28.28} {n['bssid']}  {n['band']:>7} kan.{n['ch'] or '?':>4} "
+                f"{(n['signal'] or 0):>5.0f} dBm  {n['security']}{mine}", dim=not mine)
+    analyze_wifi_scan(nets, ssid, bssid, ch, band, sig, rep)
+
+
+def analyze_wifi_scan(nets, ssid, bssid, my_ch, my_band, my_sig, rep):
+    rep.add("INFO", "Wi-Fi", f"Widocznych sieci (BSSID): {len(nets)}, "
+            f"2.4 GHz: {sum(n['band'] == '2.4 GHz' for n in nets)}, 5 GHz: {sum(n['band'] == '5 GHz' for n in nets)}, "
+            f"6 GHz: {sum(n['band'] == '6 GHz' for n in nets)}")
+    others = [n for n in nets if n["bssid"] != bssid and n["signal"] is not None and n["ch"]]
+    same_band = [n for n in others if n["band"] == my_band]
+
+    co = [n for n in same_band if n["ch"] == my_ch and n["signal"] >= -80]
+    if co:
+        sev = "WARN" if sum(n["signal"] >= -75 for n in co) >= 3 else "INFO"
+        rep.add(sev, "Wi-Fi", f"Na naszym kanale {my_ch} nadaje jeszcze {len(co)} sieci — dzielą czas antenowy",
+                [f"{n['ssid'] or '<ukryta>'} {n['bssid']} {n['signal']:.0f} dBm" for n in
+                 sorted(co, key=lambda x: -x["signal"])[:8]])
+    if my_band == "2.4 GHz":
+        if my_ch not in (1, 6, 11):
+            rep.add("WARN", "Wi-Fi", f"Kanał {my_ch} w 2.4 GHz nakłada się na sąsiednie — używaj 1, 6 lub 11")
+        adj = [n for n in same_band if 0 < abs(n["ch"] - my_ch) < 5 and n["signal"] >= -75]
+        if adj:
+            rep.add("WARN", "Wi-Fi", f"Silne sieci na nakładających się kanałach ({len(adj)}) — interferencja "
+                    "gorsza niż wspólny kanał",
+                    [f"{n['ssid'] or '<ukryta>'} kanał {n['ch']} {n['signal']:.0f} dBm" for n in
+                     sorted(adj, key=lambda x: -x["signal"])[:8]])
+
+    # najmniej zajęte kanały w paśmie
+    if my_band in ("2.4 GHz", "5 GHz"):
+        cands = [1, 6, 11] if my_band == "2.4 GHz" else CH_5GHZ_EU
+        span = 4 if my_band == "2.4 GHz" else 0
+
+        def load(c):
+            return sum(max(0.0, n["signal"] + 95) for n in same_band if abs(n["ch"] - c) <= span)
+        ranked = sorted((c for c in cands if c != my_ch), key=load)
+        best = ranked[:3]
+        if my_ch in cands and load(my_ch) > 2 * load(best[0]) + 20:
+            rep.add("INFO", "Wi-Fi", f"Mniej zajęte kanały w {my_band}: {', '.join(map(str, best))} "
+                    f"(obecny {my_ch} wyraźnie bardziej obciążony)"
+                    + ("; kanały 52–140 to DFS — router może je chwilowo zwalniać przy wykryciu radaru"
+                       if my_band == "5 GHz" else ""))
+
+    # ta sama sieć — lepszy AP / inne pasmo / niespójne zabezpieczenia
+    if ssid:
+        sib = [n for n in nets if n["ssid"] == ssid and n["bssid"] != bssid and n["signal"] is not None]
+        if my_sig is not None:
+            better = [n for n in sib if n["signal"] >= my_sig + 8]
+            if better:
+                b = max(better, key=lambda x: x["signal"])
+                rep.add("WARN", "Wi-Fi", f"Ten sam SSID ma silniejszy punkt dostępowy: {b['bssid']} "
+                        f"{b['band']} kanał {b['ch']} {b['signal']:.0f} dBm (my: {my_sig:.0f} dBm) — "
+                        "urządzenie trzyma się słabszego AP (sticky client)")
+        if my_band == "2.4 GHz":
+            five = [n for n in sib if n["band"] != "2.4 GHz" and n["signal"] >= -70]
+            if five:
+                b = max(five, key=lambda x: x["signal"])
+                rep.add("INFO", "Wi-Fi", f"Ta sama sieć jest dostępna w {b['band']} ({b['signal']:.0f} dBm) — "
+                        "połączenie tam będzie zwykle szybsze")
+        secs = {n["security"] for n in sib} | {next((n["security"] for n in nets if n["bssid"] == bssid), None)}
+        secs.discard(None)
+        if len(secs) > 1:
+            rep.add("WARN", "Wi-Fi", f"Sieć „{ssid}” występuje z różnymi zabezpieczeniami ({', '.join(sorted(secs))}) "
+                    "— możliwy fałszywy AP (evil twin) lub niespójna konfiguracja")
+        if "otwarta" in secs:
+            rep.add("WARN", "Wi-Fi", f"Sieć „{ssid}” jest otwarta (bez szyfrowania)")
+
+
 # ---------------------------------------------------------------- interfejs
 
 def analyze_iface(iface, s0, s1, duration, rep):
@@ -901,8 +1394,9 @@ def analyze_iface(iface, s0, s1, duration, rep):
     rep.add("INFO", "interfejs", f"{iface}: stan {state}, prędkość {speed or '?'} Mb/s, duplex "
             f"{duplex or '?'}, MTU {mtu}" + (" (Wi-Fi)" if wireless else ""))
     if wireless:
-        rep.add("INFO", "interfejs", "Pomiar przez Wi-Fi — testy pętli/STP mało wiarygodne, "
-                "najlepiej uruchomić na połączeniu kablowym")
+        rep.add("INFO", "interfejs", "Pomiar przez Wi-Fi — pętle i burze z sieci przewodowej są widoczne "
+                "(broadcast dociera do klientów Wi-Fi), ale STP i błędy kabla nie dotyczą tego łącza; "
+                "do diagnozy samej sieci kablowej uruchom też test po kablu")
     if duplex == "half":
         rep.add("WARN", "interfejs", "Half-duplex — prawdopodobnie niedopasowanie autonegocjacji")
     try:
@@ -939,8 +1433,11 @@ def main():
     ap.add_argument("--passive-only", action="store_true", help="tylko nasłuch, bez wysyłania pakietów")
     ap.add_argument("--force-scan", action="store_true", help="skanuj ARP także podsieci > /22")
     ap.add_argument("--no-trace", action="store_true", help="pomiń traceroute")
-    ap.add_argument("--storm-warn", type=int, default=300, help="próg WARN broadcast pps (300)")
-    ap.add_argument("--storm-crit", type=int, default=2000, help="próg CRIT broadcast pps (2000)")
+    ap.add_argument("--storm-warn", type=int, default=None,
+                    help="próg WARN broadcast pps (300 kabel / 100 Wi-Fi)")
+    ap.add_argument("--storm-crit", type=int, default=None,
+                    help="próg CRIT broadcast pps (2000 kabel / 1000 Wi-Fi)")
+    ap.add_argument("--no-wifi-scan", action="store_true", help="Wi-Fi: bez aktywnego skanu otoczenia")
     ap.add_argument("--loop-repeats", type=int, default=5, help="ile identycznych ramek = pętla (5)")
     ap.add_argument("--loop-window", type=float, default=1.0, help="okno wykrywania pętli [s] (1.0)")
     ap.add_argument("--json", help="zapisz raport do pliku JSON")
@@ -984,6 +1481,21 @@ def main():
     if logfile:
         con.out(f"Log zapisywany na bieżąco do: {os.path.abspath(logfile)}")
     con.out("Ctrl+C = pomiń bieżący krok,  2× Ctrl+C w ciągu 2 s = zakończ i pokaż raport")
+    wireless = args.wireless = is_wireless(iface)
+    if args.storm_warn is None:
+        args.storm_warn = 100 if wireless else 300
+    if args.storm_crit is None:
+        args.storm_crit = 1000 if wireless else 2000
+    mon = None
+    if wireless:
+        mon = WifiMonitor(iface, con)
+        con.out("Interfejs Wi-Fi — na żywo także: sygnał, prędkość, retransmisje, beacony, roaming, rozłączenia")
+        if not mon.iw:
+            con.log("brak narzędzia iw — dane Wi-Fi tylko z /proc/net/wireless (sudo apt install iw)", "WARN")
+        w = mon.poll()
+        if w:
+            con.log(f"start: {w}" + (f", „{mon.ssid}” {mon.bssid} kanał {freq_to_channel(mon.freq)}"
+                                     if mon.ssid else ""))
     s0 = read_stats(iface)
     t_begin = time.time()
 
@@ -1010,10 +1522,8 @@ def main():
             next_t += args.interval
             time.sleep(max(0.0, next_t - time.time()))
             now = time.time()
-            if args.quiet:
-                continue
             prev_cnt, prev_stats = passive_tick(p, con, args, iface, now - t_start,
-                                                max(now - t_prev, 1e-3), prev_cnt, prev_stats)
+                                                max(now - t_prev, 1e-3), prev_cnt, prev_stats, mon)
             t_prev = now
         ctl.armed = False
     except KeyboardInterrupt:
@@ -1030,11 +1540,15 @@ def main():
         if not args.quiet:
             hb.start()
         steps = []
+        if wireless:
+            steps.append(("Wi-Fi: łącze, kanał i otoczenie",
+                          lambda: check_wifi_env(iface, mon, rep, con, hb,
+                                                 "dump" if args.no_wifi_scan else "scan")))
         if own_ip:
             steps += [("konflikt własnego IP", lambda: check_own_ip_conflict(iface, mac, own_ip, rep, con, hb)),
                       ("skan ARP", lambda: arp_sweep(iface, net, gw, rep, args.force_scan, con, hb))]
         steps += [("DHCP DISCOVER", lambda: dhcp_discover(iface, mac, rep, p.dhcp_servers, con, hb)),
-                  ("ping bramy", lambda: check_gateway(iface, gw, rep, con, hb))]
+                  ("ping bramy", lambda: check_gateway(iface, gw, rep, con, hb, wireless))]
         internet = {"ok": False}
         steps += [("ping internetu", lambda: internet.update(ok=check_internet(args.target, rep, con, hb))),
                   ("DNS", lambda: check_dns(rep, con, hb)),
@@ -1042,6 +1556,8 @@ def main():
         if not args.no_trace:
             steps.append(("traceroute", lambda: check_routing_loop(args.target, rep, con, hb)))
         skipped = []
+        if mon:
+            mon.start_watch(args.interval)
         for n, (name, fn) in enumerate(steps, 1):
             if ctl.abort:
                 skipped.append(name)
@@ -1066,12 +1582,25 @@ def main():
             hb.end()
             report_stat_changes(con, s_before, read_stats(iface))
         hb.stop()
+        if mon:
+            mon.stop_watch()
         if skipped:
             rep.add("INFO", "skrypt", "Pominięte testy (przerwano 2× Ctrl+C)", skipped)
 
     if ctl.abort:
         con.log("test przerwany (2× Ctrl+C) — raport z tego, co zebrano", "INFO")
         rep.add("INFO", "skrypt", "Test przerwany przez użytkownika (2× Ctrl+C) — wyniki niepełne")
+    if mon:
+        if args.passive_only and not ctl.abort:   # bez wysyłania: tylko odczyty i skan z pamięci
+            con.out("\n=== Wi-Fi: łącze i otoczenie (bez aktywnego skanu) ===")
+            try:
+                ctl.armed = True
+                check_wifi_env(iface, mon, rep, con, Heartbeat(con, args.interval), "dump")
+            except KeyboardInterrupt:
+                pass
+            finally:
+                ctl.armed = False
+        analyze_wifi_monitor(mon, rep)
     analyze_iface(iface, s0, read_stats(iface), time.time() - t_begin, rep)
     if p.errors:
         rep.add("INFO", "skrypt", f"{p.errors} ramek nie udało się przeanalizować")
